@@ -14,8 +14,9 @@ CONFIG_PATH = Path("config.json")
 MAX_MESSAGE_LEN = 1900
 DISCORD_RETRY_LIMIT = 5
 
-# Числовые ID типов предметов (AssetType). Используем эндпоинт
-# /v2/users/{userId}/inventory/{assetTypeId}, который принимает ID в пути.
+# Числовые ID типов предметов (AssetType).
+# Используем эндпоинт /v2/users/{userId}/inventory/{assetTypeId},
+# который принимает ID в пути и стабильно работает с пагинацией.
 ASSET_TYPE_IDS = {
     "Hat": 8,
     "Shirt": 11,
@@ -49,6 +50,10 @@ ROBLOX_USERNAME_URL = "https://users.roblox.com/v1/usernames/users"
 DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 
 
+# ---------------------------------------------------------------------------
+# Сеть
+# ---------------------------------------------------------------------------
+
 def build_session() -> requests.Session:
     """Сессия с автоматическими ретраями для сетевых сбоев и 5xx."""
     session = requests.Session()
@@ -64,6 +69,10 @@ def build_session() -> requests.Session:
     session.mount("http://", adapter)
     return session
 
+
+# ---------------------------------------------------------------------------
+# Конфиг
+# ---------------------------------------------------------------------------
 
 def load_config(path: Path) -> dict:
     """Читает и валидирует конфиг до первого сетевого запроса."""
@@ -100,7 +109,7 @@ def load_config(path: Path) -> dict:
 
 
 def get_user_id(session: requests.Session, username: str) -> int:
-    """Ищет userId по нику. При сетевой ошибке — падает с понятным сообщением."""
+    """Ищет userId по нику."""
     try:
         resp = session.post(
             ROBLOX_USERNAME_URL,
@@ -117,8 +126,22 @@ def get_user_id(session: requests.Session, username: str) -> int:
     return data[0]["id"]
 
 
+# ---------------------------------------------------------------------------
+# Дата предмета
+# ---------------------------------------------------------------------------
+
+def get_item_date(item: dict) -> str | None:
+    """Возвращает строку с датой добавления предмета в инвентарь.
+
+    В legacy-API поле называется 'created'.
+    В Open Cloud — 'addTime'.
+    Проверяем оба, чтобы скрипт переживал изменения API.
+    """
+    return item.get("created") or item.get("addTime")
+
+
 def parse_add_time(value) -> datetime | None:
-    """Безопасно парсит addTime. Возвращает timezone-aware datetime или None."""
+    """Безопасно парсит дату. Возвращает timezone-aware datetime или None."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -129,6 +152,10 @@ def parse_add_time(value) -> datetime | None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
+
+# ---------------------------------------------------------------------------
+# Загрузка инвентаря
+# ---------------------------------------------------------------------------
 
 def fetch_items_for_type(
     session: requests.Session, user_id: int, asset_type: str, asset_type_id: int
@@ -192,7 +219,7 @@ def fetch_items_for_type(
 
 
 def fetch_all_items(session: requests.Session, user_id: int) -> list[dict]:
-    """Собирает предметы по каждому типу отдельно (устраняет 400)."""
+    """Собирает предметы по каждому типу отдельно."""
     all_items: list[dict] = []
     total_types = len(ASSET_TYPE_IDS)
 
@@ -201,21 +228,25 @@ def fetch_all_items(session: requests.Session, user_id: int) -> list[dict]:
         type_items = fetch_items_for_type(session, user_id, asset_type, asset_type_id)
         print(f"    найдено: {len(type_items)}")
         all_items.extend(type_items)
-        time.sleep(0.3)  # мягкая пауза между типами
+        time.sleep(0.3)
 
     return all_items
 
 
+# ---------------------------------------------------------------------------
+# Фильтрация и отчёт
+# ---------------------------------------------------------------------------
+
 def filter_by_period(
     items: list[dict], start_date: str | None, end_date: str | None
 ) -> list[dict]:
-    """Фильтрует по дате добавления включительно. Некорректные даты отбрасываются."""
+    """Фильтрует по дате добавления включительно."""
     start = datetime.fromisoformat(start_date).date() if start_date else None
     end = datetime.fromisoformat(end_date).date() if end_date else None
 
     filtered: list[dict] = []
     for item in items:
-        add_time = parse_add_time(item.get("addTime"))
+        add_time = parse_add_time(get_item_date(item))
         if add_time is None:
             continue
         item_date = add_time.date()
@@ -228,17 +259,17 @@ def filter_by_period(
 
 
 def build_category_block(category: str, cat_items: list[dict]) -> str:
-    """Один блок статистики. Безопасен к отсутствию addTime/assetId."""
+    """Один блок статистики. Безопасен к отсутствию даты/assetId."""
     fallback = datetime.max.replace(tzinfo=timezone.utc)
-    cat_items.sort(key=lambda x: parse_add_time(x.get("addTime")) or fallback)
+    cat_items.sort(key=lambda x: parse_add_time(get_item_date(x)) or fallback)
 
     first, last = cat_items[0], cat_items[-1]
 
     def get_asset_id(item: dict) -> str:
         return str(item.get("assetId") or item.get("id") or "—")
 
-    first_time = parse_add_time(first.get("addTime"))
-    last_time = parse_add_time(last.get("addTime"))
+    first_time = parse_add_time(get_item_date(first))
+    last_time = parse_add_time(get_item_date(last))
 
     first_str = first_time.strftime("%Y-%m-%d") if first_time else "—"
     last_str = last_time.strftime("%Y-%m-%d") if last_time else "—"
@@ -250,7 +281,9 @@ def build_category_block(category: str, cat_items: list[dict]) -> str:
     )
 
 
-def split_into_messages(header: str, blocks: list[str], limit: int = MAX_MESSAGE_LEN) -> list[str]:
+def split_into_messages(
+    header: str, blocks: list[str], limit: int = MAX_MESSAGE_LEN
+) -> list[str]:
     """Пакует блоки в сообщения, не разрезая блоки."""
     messages: list[str] = []
     current = header
@@ -295,6 +328,10 @@ def build_report(items: list[dict], user_id: int) -> list[str]:
 
     return chunks
 
+
+# ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
 
 def send_discord_messages(
     session: requests.Session, token: str, channel_id: int, messages: list[str]
@@ -345,6 +382,10 @@ def send_discord_messages(
             time.sleep(1.2)
 
 
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     try:
         config = load_config(CONFIG_PATH)
@@ -364,6 +405,12 @@ def main() -> None:
     print("Загрузка инвентаря...")
     all_items = fetch_all_items(session, user_id)
     print(f"Предметов до фильтрации: {len(all_items)}")
+
+    # Отладочный вывод: какие поля с датой реально приходят.
+    if all_items:
+        sample = all_items[0]
+        date_fields = {k: v for k, v in sample.items() if k in ("created", "addTime", "updated")}
+        print(f"  Пример дат у первого предмета: {date_fields}")
 
     filtered = filter_by_period(
         all_items, config.get("start_date"), config.get("end_date")
@@ -389,10 +436,9 @@ if __name__ == "__main__":
         print("\nПрервано пользователем.", file=sys.stderr)
         sys.exit(1)
     except SystemExit as exc:
-        # Сообщения валидации уже отформатированы — не дублируем трейсбек.
         if exc.code not in (0, None):
             print(f"Завершение: {exc}", file=sys.stderr)
         sys.exit(exc.code or 1)
-    except Exception as exc:  # последняя страховка от неожиданных падений
+    except Exception as exc:
         print(f"Непредвиденная ошибка: {exc}", file=sys.stderr)
         sys.exit(1)
