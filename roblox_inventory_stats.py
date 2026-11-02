@@ -16,39 +16,95 @@ DISCORD_RETRY_LIMIT = 5
 CATALOG_URL = "https://www.roblox.com/catalog/{asset_id}"
 ASSET_DETAILS_URL = "https://economy.roblox.com/v2/assets/{asset_id}/details"
 
+# Что сканируем. Face (18) исключён, анимации кроме Emote — тоже.
 ASSET_TYPE_IDS = {
+    # Accessories
     "Hat": 8,
-    "Shirt": 11,
-    "Pants": 12,
-    "TShirt": 2,
-    "Face": 18,
-    "Gear": 19,
-    "Package": 32,
-    "HairAccessory": 41,
+    "EarAccessory": 57,
     "FaceAccessory": 42,
+    "EyeAccessory": 58,
+    "HairAccessory": 41,
     "NeckAccessory": 43,
     "ShoulderAccessory": 44,
     "FrontAccessory": 45,
     "BackAccessory": 46,
     "WaistAccessory": 47,
-    "EarAccessory": 57,
-    "EyeAccessory": 58,
-    "ClimbAnimation": 48,
-    "DeathAnimation": 49,
-    "FallAnimation": 50,
-    "IdleAnimation": 51,
-    "JumpAnimation": 52,
-    "RunAnimation": 53,
-    "SwimAnimation": 54,
-    "WalkAnimation": 55,
+    "Gear": 19,
+    # Backgrounds
+    "AvatarBackground": 92,
+    # Layered Clothes
+    "TShirtAccessory": 64,
+    "ShirtAccessory": 65,
+    "PantsAccessory": 66,
+    "JacketAccessory": 67,
+    "SweaterAccessory": 68,
+    "ShortsAccessory": 69,
+    "LeftShoeAccessory": 70,
+    "RightShoeAccessory": 71,
+    "DressSkirtAccessory": 72,
+    # Dynamic Heads
+    "DynamicHead": 79,
+    # Makeup
+    "FaceMakeup": 88,
+    "LipMakeup": 89,
+    "EyeMakeup": 90,
+    "EyebrowAccessory": 76,
+    "EyelashAccessory": 77,
+    # Emotes
     "EmoteAnimation": 61,
+    # Avatar Bundles
+    "Package": 32,
+    # Classic Clothes
+    "Shirt": 11,
+    "Pants": 12,
+    "TShirt": 2,
+    # Badges
+    "Badge": 21,
 }
+
+# Итоговые подкатегории в нужном порядке.
+# Формат: (main_category, subgroup_name, [asset_types...])
+SUBGROUP_DEFINITIONS = [
+    ("Accessories", "Hat",    ["Hat", "EarAccessory"]),
+    ("Accessories", "Face",   ["FaceAccessory", "EyeAccessory"]),
+    ("Accessories", "Hair",   ["HairAccessory"]),
+    ("Accessories", "Neck",   ["NeckAccessory"]),
+    ("Accessories", "Shoulder", ["ShoulderAccessory"]),
+    ("Accessories", "Front",  ["FrontAccessory"]),
+    ("Accessories", "Back",   ["BackAccessory"]),
+    ("Accessories", "Waist",  ["WaistAccessory"]),
+    ("Accessories", "Gear",   ["Gear"]),
+    ("Backgrounds", "Background", ["AvatarBackground"]),
+    ("Layered Clothes", "Tops", [
+        "TShirtAccessory", "ShirtAccessory", "JacketAccessory", "SweaterAccessory",
+    ]),
+    ("Layered Clothes", "Bottoms", [
+        "PantsAccessory", "ShortsAccessory", "DressSkirtAccessory",
+    ]),
+    ("Layered Clothes", "Shoes", ["LeftShoeAccessory", "RightShoeAccessory"]),
+    ("Dynamic Heads", "Dynamic Head", ["DynamicHead"]),
+    ("Makeup", "Makeup", [
+        "FaceMakeup", "LipMakeup", "EyeMakeup",
+        "EyebrowAccessory", "EyelashAccessory",
+    ]),
+    ("Emotes", "Emote", ["EmoteAnimation"]),
+    ("Avatar Bundles", "Bundle", ["Package"]),
+    ("Classic Clothes", "Shirt", ["Shirt"]),
+    ("Classic Clothes", "Pants", ["Pants"]),
+    ("Classic Clothes", "T-Shirt", ["TShirt"]),
+    ("Badges", "Badge", ["Badge"]),
+]
+
+# assetType -> (main_category, subgroup_name)
+ASSET_TO_SUBGROUP: dict[str, tuple[str, str]] = {}
+for _main, _sub, _types in SUBGROUP_DEFINITIONS:
+    for _t in _types:
+        ASSET_TO_SUBGROUP[_t] = (_main, _sub)
 
 ROBLOX_INVENTORY_BASE = "https://inventory.roblox.com/v2/users/{user_id}/inventory/{asset_type_id}"
 ROBLOX_USERNAME_URL = "https://users.roblox.com/v1/usernames/users"
 DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 
-# Кэш имён ассетов, чтобы не дёргать API повторно для одного и того же id.
 _NAME_CACHE: dict[int, str] = {}
 
 
@@ -145,7 +201,6 @@ def parse_add_time(value) -> datetime | None:
 
 
 def sanitize_name(name: str) -> str:
-    """Убираем переносы строк и экранируем символы Discord-разметки."""
     name = name.replace("\n", " ").replace("\r", " ").strip()
     for ch in ("\\", "[", "]"):
         name = name.replace(ch, "\\" + ch)
@@ -155,7 +210,6 @@ def sanitize_name(name: str) -> str:
 def get_item_name(
     session: requests.Session, asset_id: int, item: dict | None = None
 ) -> str:
-    """Имя ассета: из ответа инвентаря, из кэша или из Roblox API."""
     if item and item.get("name"):
         return sanitize_name(str(item["name"]))
 
@@ -185,11 +239,9 @@ def get_item_asset_id(item: dict) -> int | None:
 
 
 def format_item_line(item: dict, session: requests.Session, date_str: str) -> str:
-    """Формат: `assetId - [Name](catalog link) (date)`."""
     asset_id = get_item_asset_id(item)
     if not asset_id:
         return f"— ({date_str})"
-
     name = get_item_name(session, asset_id, item)
     url = CATALOG_URL.format(asset_id=asset_id)
     return f"{asset_id} - [{name}]({url}) ({date_str})"
@@ -273,7 +325,7 @@ def fetch_all_items(session: requests.Session, user_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Фильтрация и отчёт
+# Фильтрация
 # ---------------------------------------------------------------------------
 
 def filter_by_period(
@@ -296,14 +348,17 @@ def filter_by_period(
     return filtered
 
 
-def build_category_block(
-    category: str, cat_items: list[dict], session: requests.Session
+# ---------------------------------------------------------------------------
+# Отчёт
+# ---------------------------------------------------------------------------
+
+def build_subgroup_block(
+    subgroup_name: str, cat_items: list[dict], session: requests.Session
 ) -> str:
     fallback = datetime.max.replace(tzinfo=timezone.utc)
     cat_items.sort(key=lambda x: parse_add_time(get_item_date(x)) or fallback)
 
     first, last = cat_items[0], cat_items[-1]
-
     first_time = parse_add_time(get_item_date(first))
     last_time = parse_add_time(get_item_date(last))
 
@@ -315,22 +370,52 @@ def build_category_block(
 
     count = len(cat_items)
     return (
-        f"**{category}** — `{count}` item{'s' if count != 1 else ''}\n"
+        f"**{subgroup_name}** — `{count}` item{'s' if count != 1 else ''}\n"
         f"  • First: {first_line}\n"
         f"  • Last: {last_line}"
     )
 
 
+def build_report_units(
+    items: list[dict], session: requests.Session
+) -> list[str]:
+    """Возвращает список «атомарных» блоков. Заголовок категории склеен с первым блоком,
+    чтобы при разбиении по длине заголовок не оторвался от содержимого."""
+    by_subgroup: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for item in items:
+        asset_type = item.get("assetType")
+        mapping = ASSET_TO_SUBGROUP.get(asset_type)
+        if not mapping:
+            continue
+        by_subgroup[mapping].append(item)
+
+    units: list[str] = []
+    current_main: str | None = None
+    for main_cat, subgroup_name, _asset_types in SUBGROUP_DEFINITIONS:
+        key = (main_cat, subgroup_name)
+        if key not in by_subgroup:
+            continue
+        block = build_subgroup_block(subgroup_name, by_subgroup[key], session)
+
+        if main_cat != current_main:
+            units.append(f"### {main_cat}\n\n{block}")
+            current_main = main_cat
+        else:
+            units.append(block)
+
+    return units
+
+
 def split_into_messages(
-    header: str, blocks: list[str], limit: int = MAX_MESSAGE_LEN
+    header: str, units: list[str], limit: int = MAX_MESSAGE_LEN
 ) -> list[str]:
     messages: list[str] = []
     current = header
-    for block in blocks:
-        candidate = f"{current}\n\n{block}" if current else block
+    for unit in units:
+        candidate = f"{current}\n\n{unit}" if current else unit
         if len(candidate) > limit and current:
             messages.append(current)
-            current = block
+            current = unit
         else:
             current = candidate
     if current.strip():
@@ -341,26 +426,17 @@ def split_into_messages(
 def build_report(
     items: list[dict], user_id: int, session: requests.Session
 ) -> list[str]:
-    by_category: dict[str, list[dict]] = defaultdict(list)
-    for item in items:
-        asset_type = item.get("assetType")
-        if asset_type in ASSET_TYPE_IDS:
-            by_category[asset_type].append(item)
-
-    total_items = sum(len(v) for v in by_category.values())
+    total_items = len(items)
     header = (
         f"📊 **Roblox Inventory Statistics** (userId: `{user_id}`)\n"
         f"Total items in period: **{total_items}**"
     )
 
-    if not by_category:
+    units = build_report_units(items, session)
+    if not units:
         return [header + "\n\n_No items found in the specified period._"]
 
-    blocks = [
-        build_category_block(category, by_category[category], session)
-        for category in sorted(by_category)
-    ]
-    chunks = split_into_messages(header, blocks)
+    chunks = split_into_messages(header, units)
 
     if len(chunks) > 1:
         total = len(chunks)
@@ -444,13 +520,6 @@ def main() -> None:
     print("Fetching inventory...")
     all_items = fetch_all_items(session, user_id)
     print(f"Items before filtering: {len(all_items)}")
-
-    if all_items:
-        sample = all_items[0]
-        date_fields = {
-            k: v for k, v in sample.items() if k in ("created", "addTime", "updated")
-        }
-        print(f"  Sample date fields: {date_fields}")
 
     filtered = filter_by_period(
         all_items, config.get("start_date"), config.get("end_date")
