@@ -1,102 +1,242 @@
 import json
+import sys
 import time
-import requests
-from datetime import datetime
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 CONFIG_PATH = Path("config.json")
 
-# Лимит Discord — 2000 символов. Берём с запасом.
 MAX_MESSAGE_LEN = 1900
-# Пауза между сообщениями (Discord: ~5 сообщений / 5 секунд на канал).
-MESSAGES_DELAY_SEC = 1.2
+DISCORD_RETRY_LIMIT = 5
 
-ASSET_TYPES = [
-    "Hat", "Shirt", "Pants", "TShirt", "Face", "Gear", "Package",
-    "HairAccessory", "FaceAccessory", "NeckAccessory", "ShoulderAccessory",
-    "FrontAccessory", "BackAccessory", "WaistAccessory", "EarAccessory", "EyeAccessory",
-    "ClimbAnimation", "DeathAnimation", "FallAnimation", "IdleAnimation",
-    "JumpAnimation", "RunAnimation", "SwimAnimation", "WalkAnimation", "EmoteAnimation",
-]
+# Числовые ID типов предметов (AssetType). Используем эндпоинт
+# /v2/users/{userId}/inventory/{assetTypeId}, который принимает ID в пути.
+ASSET_TYPE_IDS = {
+    "Hat": 8,
+    "Shirt": 11,
+    "Pants": 12,
+    "TShirt": 2,
+    "Face": 18,
+    "Gear": 19,
+    "Package": 32,
+    "HairAccessory": 41,
+    "FaceAccessory": 42,
+    "NeckAccessory": 43,
+    "ShoulderAccessory": 44,
+    "FrontAccessory": 45,
+    "BackAccessory": 46,
+    "WaistAccessory": 47,
+    "EarAccessory": 57,
+    "EyeAccessory": 58,
+    "ClimbAnimation": 48,
+    "DeathAnimation": 49,
+    "FallAnimation": 50,
+    "IdleAnimation": 51,
+    "JumpAnimation": 52,
+    "RunAnimation": 53,
+    "SwimAnimation": 54,
+    "WalkAnimation": 55,
+    "EmoteAnimation": 61,
+}
 
-ROBLOX_INVENTORY_URL = "https://inventory.roblox.com/v2/users/{user_id}/inventory"
+ROBLOX_INVENTORY_BASE = "https://inventory.roblox.com/v2/users/{user_id}/inventory/{asset_type_id}"
+ROBLOX_USERNAME_URL = "https://users.roblox.com/v1/usernames/users"
+DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 
 
-def get_user_id(username: str) -> int | None:
-    url = "https://users.roblox.com/v1/usernames/users"
-    payload = {"usernames": [username], "excludeBannedUsers": True}
-    resp = requests.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
+def build_session() -> requests.Session:
+    """Сессия с автоматическими ретраями для сетевых сбоев и 5xx."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def load_config(path: Path) -> dict:
+    """Читает и валидирует конфиг до первого сетевого запроса."""
+    if not path.exists():
+        raise SystemExit(f"Файл {path} не найден.")
+
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Ошибка в JSON-конфиге: {exc}") from exc
+
+    required = ("discord_bot_token", "discord_channel_id")
+    for field in required:
+        if not config.get(field):
+            raise SystemExit(f"В конфиге не заполнено обязательное поле: {field}")
+
+    if not isinstance(config["discord_channel_id"], int):
+        raise SystemExit("discord_channel_id должен быть числом (без кавычек).")
+
+    for date_field in ("start_date", "end_date"):
+        value = config.get(date_field)
+        if value is not None:
+            try:
+                datetime.fromisoformat(value)
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(
+                    f"Поле {date_field} должно быть в формате YYYY-MM-DD или null."
+                ) from exc
+
+    if not config.get("user_id") and not config.get("username"):
+        raise SystemExit("Укажите user_id или username в config.json.")
+
+    return config
+
+
+def get_user_id(session: requests.Session, username: str) -> int:
+    """Ищет userId по нику. При сетевой ошибке — падает с понятным сообщением."""
+    try:
+        resp = session.post(
+            ROBLOX_USERNAME_URL,
+            json={"usernames": [username], "excludeBannedUsers": True},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise SystemExit(f"Не удалось найти пользователя '{username}': {exc}") from exc
+
     data = resp.json().get("data", [])
-    return data[0]["id"] if data else None
+    if not data:
+        raise SystemExit(f"Пользователь '{username}' не найден.")
+    return data[0]["id"]
 
 
-def parse_add_time(value: str) -> datetime | None:
-    if not value:
+def parse_add_time(value) -> datetime | None:
+    """Безопасно парсит addTime. Возвращает timezone-aware datetime или None."""
+    if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
-def fetch_all_items(user_id: int) -> list[dict]:
-    items = []
+def fetch_items_for_type(
+    session: requests.Session, user_id: int, asset_type: str, asset_type_id: int
+) -> list[dict]:
+    """Загружает все страницы для одного типа предметов."""
+    items: list[dict] = []
     cursor = None
+    url = ROBLOX_INVENTORY_BASE.format(user_id=user_id, asset_type_id=asset_type_id)
+
     while True:
-        params = {"assetTypes": ",".join(ASSET_TYPES), "limit": 100}
+        params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
 
-        resp = requests.get(
-            ROBLOX_INVENTORY_URL.format(user_id=user_id),
-            params=params,
-            timeout=30,
-        )
+        try:
+            resp = session.get(url, params=params, timeout=30)
+        except requests.RequestException as exc:
+            print(f"    [сеть] {asset_type}: {exc} — пропускаем тип.")
+            break
+
         if resp.status_code == 403:
-            raise RuntimeError(
-                "Инвентарь закрыт. Откройте его в настройках приватности Roblox."
+            raise SystemExit(
+                "Инвентарь закрыт. Откройте его: Настройки → Privacy → "
+                "«Who can see my inventory» → Everyone."
             )
-        resp.raise_for_status()
-        data = resp.json()
+        if resp.status_code == 400:
+            print(f"    [пропуск] {asset_type}: 400 (тип не поддерживается).")
+            break
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 5))
+            print(f"    [429] {asset_type}: ждём {retry_after:.0f} с...")
+            time.sleep(retry_after)
+            continue
+        if resp.status_code >= 500:
+            print(f"    [5xx] {asset_type}: {resp.status_code} — пропускаем тип.")
+            break
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            print(f"    [HTTP] {asset_type}: {exc} — пропускаем тип.")
+            break
+
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"    [JSON] {asset_type}: некорректный ответ — пропускаем тип.")
+            break
 
         page_items = data.get("data", [])
+        for item in page_items:
+            # В ответах этого эндпоинта поля assetType может не быть.
+            item.setdefault("assetType", asset_type)
         items.extend(page_items)
 
         cursor = data.get("nextPageCursor")
         if not cursor or not page_items:
             break
+
     return items
+
+
+def fetch_all_items(session: requests.Session, user_id: int) -> list[dict]:
+    """Собирает предметы по каждому типу отдельно (устраняет 400)."""
+    all_items: list[dict] = []
+    total_types = len(ASSET_TYPE_IDS)
+
+    for index, (asset_type, asset_type_id) in enumerate(ASSET_TYPE_IDS.items(), 1):
+        print(f"[{index}/{total_types}] {asset_type}...")
+        type_items = fetch_items_for_type(session, user_id, asset_type, asset_type_id)
+        print(f"    найдено: {len(type_items)}")
+        all_items.extend(type_items)
+        time.sleep(0.3)  # мягкая пауза между типами
+
+    return all_items
 
 
 def filter_by_period(
     items: list[dict], start_date: str | None, end_date: str | None
 ) -> list[dict]:
-    start_dt = datetime.fromisoformat(start_date).date() if start_date else None
-    end_dt = datetime.fromisoformat(end_date).date() if end_date else None
+    """Фильтрует по дате добавления включительно. Некорректные даты отбрасываются."""
+    start = datetime.fromisoformat(start_date).date() if start_date else None
+    end = datetime.fromisoformat(end_date).date() if end_date else None
 
-    filtered = []
+    filtered: list[dict] = []
     for item in items:
         add_time = parse_add_time(item.get("addTime"))
-        if not add_time:
+        if add_time is None:
             continue
         item_date = add_time.date()
-        if start_dt and item_date < start_dt:
+        if start and item_date < start:
             continue
-        if end_dt and item_date > end_dt:
+        if end and item_date > end:
             continue
         filtered.append(item)
     return filtered
 
 
 def build_category_block(category: str, cat_items: list[dict]) -> str:
-    """Один блок статистики для категории (3 строки)."""
-    cat_items.sort(key=lambda x: parse_add_time(x.get("addTime")) or datetime.max)
+    """Один блок статистики. Безопасен к отсутствию addTime/assetId."""
+    fallback = datetime.max.replace(tzinfo=timezone.utc)
+    cat_items.sort(key=lambda x: parse_add_time(x.get("addTime")) or fallback)
+
     first, last = cat_items[0], cat_items[-1]
 
-    first_id = first.get("assetId") or first.get("id")
-    last_id = last.get("assetId") or last.get("id")
+    def get_asset_id(item: dict) -> str:
+        return str(item.get("assetId") or item.get("id") or "—")
+
     first_time = parse_add_time(first.get("addTime"))
     last_time = parse_add_time(last.get("addTime"))
 
@@ -105,13 +245,13 @@ def build_category_block(category: str, cat_items: list[dict]) -> str:
 
     return (
         f"**{category}** — `{len(cat_items)}` шт.\n"
-        f"  • Первый: assetId `{first_id}` ({first_str})\n"
-        f"  • Последний: assetId `{last_id}` ({last_str})"
+        f"  • Первый: assetId `{get_asset_id(first)}` ({first_str})\n"
+        f"  • Последний: assetId `{get_asset_id(last)}` ({last_str})"
     )
 
 
 def split_into_messages(header: str, blocks: list[str], limit: int = MAX_MESSAGE_LEN) -> list[str]:
-    """Жадно пакует блоки в сообщения, не разрезая блоки."""
+    """Пакует блоки в сообщения, не разрезая блоки."""
     messages: list[str] = []
     current = header
     for block in blocks:
@@ -127,15 +267,14 @@ def split_into_messages(header: str, blocks: list[str], limit: int = MAX_MESSAGE
 
 
 def build_report(items: list[dict], user_id: int) -> list[str]:
-    """Возвращает список сообщений (готовых к отправке в Discord)."""
+    """Формирует список сообщений для Discord."""
     by_category: dict[str, list[dict]] = defaultdict(list)
     for item in items:
         asset_type = item.get("assetType")
-        if asset_type in ASSET_TYPES:
+        if asset_type in ASSET_TYPE_IDS:
             by_category[asset_type].append(item)
 
     total_items = sum(len(v) for v in by_category.values())
-
     header = (
         f"📊 **Статистика инвентаря Roblox** (userId: `{user_id}`)\n"
         f"Всего предметов за период: **{total_items}**"
@@ -144,12 +283,12 @@ def build_report(items: list[dict], user_id: int) -> list[str]:
     if not by_category:
         return [header + "\n\n_За указанный период предметов не найдено._"]
 
-    blocks = [build_category_block(cat, by_category[cat]) for cat in sorted(by_category)]
-
-    # Разбиваем по лимиту
+    blocks = [
+        build_category_block(category, by_category[category])
+        for category in sorted(by_category)
+    ]
     chunks = split_into_messages(header, blocks)
 
-    # Если сообщений больше одного — добавим нумерацию вида (1/3)
     if len(chunks) > 1:
         total = len(chunks)
         chunks = [f"{chunk}\n\n_({i + 1}/{total})_" for i, chunk in enumerate(chunks)]
@@ -157,46 +296,73 @@ def build_report(items: list[dict], user_id: int) -> list[str]:
     return chunks
 
 
-def send_messages_to_discord(token: str, channel_id: int, messages: list[str]) -> None:
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+def send_discord_messages(
+    session: requests.Session, token: str, channel_id: int, messages: list[str]
+) -> None:
+    """Отправляет сообщения с обработкой 429 и проверкой лимита 2000 символов."""
+    url = DISCORD_MESSAGES_URL.format(channel_id=channel_id)
     headers = {
         "Authorization": f"Bot {token}",
         "Content-Type": "application/json",
     }
-    for i, content in enumerate(messages):
+
+    for index, content in enumerate(messages, 1):
         if len(content) > 2000:
-            raise RuntimeError(
-                f"Сообщение #{i + 1} получилось длиной {len(content)} символов — "
-                "это превышает лимит Discord. Уменьшите MAX_MESSAGE_LEN."
+            raise SystemExit(
+                f"Сообщение #{index} длиной {len(content)} символов превышает лимит Discord."
             )
-        resp = requests.post(
-            url, headers=headers, json={"content": content}, timeout=30
-        )
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"Discord API вернул {resp.status_code} на сообщении #{i + 1}: {resp.text}"
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = session.post(
+                    url, headers=headers, json={"content": content}, timeout=30
+                )
+            except requests.RequestException as exc:
+                raise SystemExit(f"Сеть при отправке в Discord: {exc}") from exc
+
+            if resp.status_code in (200, 201):
+                break
+
+            if resp.status_code == 429:
+                if attempt > DISCORD_RETRY_LIMIT:
+                    raise SystemExit("Discord: превышен лимит повторных попыток при 429.")
+                try:
+                    retry_after = float(resp.json().get("retry_after", 2))
+                except (ValueError, TypeError):
+                    retry_after = 2.0
+                print(f"    [Discord 429] ждём {retry_after:.1f} с...")
+                time.sleep(retry_after)
+                continue
+
+            raise SystemExit(
+                f"Discord API вернул {resp.status_code} на сообщении #{index}: {resp.text}"
             )
-        if i < len(messages) - 1:
-            time.sleep(MESSAGES_DELAY_SEC)
+
+        print(f"    отправлено сообщение {index}/{len(messages)}")
+        if index < len(messages):
+            time.sleep(1.2)
 
 
 def main() -> None:
-    if not CONFIG_PATH.exists():
-        raise SystemExit("Файл config.json не найден.")
+    try:
+        config = load_config(CONFIG_PATH)
+    except SystemExit as exc:
+        print(f"Ошибка конфига: {exc}", file=sys.stderr)
+        return
 
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    session = build_session()
 
     user_id = config.get("user_id")
     if not user_id:
-        username = config.get("username")
-        if not username:
-            raise SystemExit("Укажите user_id или username в config.json.")
-        user_id = get_user_id(username)
-        if not user_id:
-            raise SystemExit(f"Пользователь '{username}' не найден.")
+        username = config["username"]
+        print(f"Поиск userId по нику '{username}'...")
+        user_id = get_user_id(session, username)
+        print(f"  userId: {user_id}")
 
     print("Загрузка инвентаря...")
-    all_items = fetch_all_items(user_id)
+    all_items = fetch_all_items(session, user_id)
     print(f"Предметов до фильтрации: {len(all_items)}")
 
     filtered = filter_by_period(
@@ -207,13 +373,26 @@ def main() -> None:
     messages = build_report(filtered, user_id)
     print(f"Сформировано сообщений: {len(messages)}")
 
-    send_messages_to_discord(
+    send_discord_messages(
+        session,
         config["discord_bot_token"],
         config["discord_channel_id"],
         messages,
     )
-    print("Отчёт отправлен в Discord.")
+    print("Готово: отчёт отправлен в Discord.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.", file=sys.stderr)
+        sys.exit(1)
+    except SystemExit as exc:
+        # Сообщения валидации уже отформатированы — не дублируем трейсбек.
+        if exc.code not in (0, None):
+            print(f"Завершение: {exc}", file=sys.stderr)
+        sys.exit(exc.code or 1)
+    except Exception as exc:  # последняя страховка от неожиданных падений
+        print(f"Непредвиденная ошибка: {exc}", file=sys.stderr)
+        sys.exit(1)
